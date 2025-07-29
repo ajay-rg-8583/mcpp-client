@@ -95,10 +95,11 @@ export interface ReferenceResult {
 
 export interface ResolveResult {
     resolved_data: unknown;
-    metadata: {
-        placeholders_resolved: number;
-        cache_hits: number;
-        cache_misses: number;
+    resolution_status?: {
+        total_placeholders: number;
+        resolved_placeholders: number;
+        failed_placeholders: string[];
+        success_rate: number;
     };
 }
 
@@ -174,7 +175,7 @@ export class McpClient {
             const requestBody = {
                 jsonrpc: '2.0',
                 id: `req-${Date.now()}`,
-                method: 'mcpp/get_references',
+                method: 'mcpp/find_reference',
                 params: {
                     tool_call_id: toolCallId,
                     keyword: keyword,
@@ -309,30 +310,33 @@ export class McpClient {
      */
     async resolveData(placeholders: Record<string, string>): Promise<Record<string, unknown>> {
         try {
-            // Build text with placeholders for batch resolution
+            // Build data structure with placeholders for batch resolution
             const placeholderEntries = Object.entries(placeholders);
-            const textWithPlaceholders = placeholderEntries.map(([key, placeholder]) => {
+            const dataWithPlaceholders: Record<string, string> = {};
+            
+            for (const [key, placeholder] of placeholderEntries) {
                 // Strip serverKey prefixes from placeholders before sending to server
                 if (typeof placeholder === 'string') {
                     // Match {serverKey:toolCallId.rowIndex.columnName}
                     const match = placeholder.match(/^\{([^:}]+):([^}]+)\}$/);
                     if (match) {
                         // Remove serverKey: prefix for the server
-                        return `${key}:{${match[2]}}`;
+                        dataWithPlaceholders[key] = `{${match[2]}}`;
                     } else {
                         // Keep as-is if no serverKey prefix
-                        return `${key}:${placeholder}`;
+                        dataWithPlaceholders[key] = placeholder;
                     }
+                } else {
+                    dataWithPlaceholders[key] = placeholder;
                 }
-                return `${key}:${placeholder}`;
-            }).join(' ');
+            }
 
             const requestBody = {
                 jsonrpc: '2.0',
                 id: `req-${Date.now()}`,
                 method: 'mcpp/resolve_placeholders',
                 params: {
-                    text: textWithPlaceholders
+                    data: dataWithPlaceholders
                 },
             };
             console.log(`[MCPP Client] Batch resolve request to ${this.serverUrl}: ${JSON.stringify(requestBody)}`);
@@ -342,25 +346,24 @@ export class McpClient {
                     'Content-Type': 'application/json'
                 }
             });
-            const rpcResponse = parseMcpResponse<{ result: { placeholders: Record<string, unknown> }, error?: unknown }>(response.data);
-            if (rpcResponse && rpcResponse.result && rpcResponse.result.placeholders) {
-                // Map the resolved placeholders back to the original argument keys
-                const resolvedData: Record<string, unknown> = {};
-                for (const [key, originalPlaceholder] of placeholderEntries) {
-                    // Find the resolved value for this key's placeholder
-                    const strippedPlaceholder = typeof originalPlaceholder === 'string' 
-                        ? originalPlaceholder.replace(/^{[^:}]+:/, '{').replace(/^{|}$/g, '')
-                        : originalPlaceholder;
-                    
-                    for (const [resolvedKey, resolvedValue] of Object.entries(rpcResponse.result.placeholders)) {
-                        const resolvedKeyStripped = resolvedKey.replace(/^{|}$/g, '');
-                        if (resolvedKeyStripped === strippedPlaceholder) {
-                            resolvedData[key] = resolvedValue;
-                            break;
-                        }
+            
+            interface BatchResolveResponse {
+                result: {
+                    resolved_data: Record<string, unknown>,
+                    resolution_status?: {
+                        total_placeholders: number,
+                        resolved_placeholders: number,
+                        failed_placeholders: string[],
+                        success_rate: number
                     }
-                }
-                return resolvedData;
+                },
+                error?: unknown
+            }
+            
+            const rpcResponse = parseMcpResponse<BatchResolveResponse>(response.data);
+            if (rpcResponse && rpcResponse.result && rpcResponse.result.resolved_data) {
+                // The server now returns resolved_data directly as a map
+                return rpcResponse.result.resolved_data as Record<string, unknown>;
             }
             throw new Error('No result from mcpp/resolve_placeholders');
         } catch (error) {
@@ -384,12 +387,19 @@ export class McpClient {
         }
     } | null> {
         try {
+            console.log(`[MCPP Client] resolvePlaceholderData called with data:`, data);
+            console.log(`[MCPP Client] Data type:`, typeof data);
+            
+            // Process data to strip server key prefixes from placeholders
+            const processedData = this.stripServerKeysFromPlaceholders(data);
+            console.log(`[MCPP Client] Processed data after stripping server keys:`, processedData);
+            
             const requestBody = {
                 jsonrpc: '2.0',
                 id: `req-${Date.now()}`,
                 method: 'mcpp/resolve_placeholders',
                 params: {
-                    data: data
+                    data: processedData
                 },
             };
             console.log(`[MCPP Client] Resolve placeholders request to ${this.serverUrl}: ${JSON.stringify(requestBody)}`);
@@ -400,8 +410,10 @@ export class McpClient {
                 }
             });
             
+            console.log(`[MCPP Client] Raw response from server:`, response.data);
+            
             interface PlaceholderResponse {
-                result: {
+                result?: {
                     resolved_data: unknown,
                     resolution_status?: {
                         total_placeholders: number,
@@ -410,17 +422,41 @@ export class McpClient {
                         success_rate: number
                     }
                 },
-                error?: unknown
+                error?: {
+                    code: number,
+                    message: string,
+                    data?: unknown
+                }
             }
             
             const rpcResponse = parseMcpResponse<PlaceholderResponse>(response.data);
-            if (rpcResponse && rpcResponse.result) {
+            if (rpcResponse.result) {
+                // Log resolution status for debugging
+                if (rpcResponse.result.resolution_status) {
+                    const status = rpcResponse.result.resolution_status;
+                    console.log(`[MCPP Client] Placeholder resolution: ${status.resolved_placeholders}/${status.total_placeholders} resolved (${(status.success_rate * 100).toFixed(1)}%)`);
+                    if (status.failed_placeholders.length > 0) {
+                        console.warn(`[MCPP Client] Failed placeholders: ${status.failed_placeholders.join(', ')}`);
+                    }
+                }
+                
                 return { 
                     data: rpcResponse.result.resolved_data,
                     resolution_status: rpcResponse.result.resolution_status
                 };
+            } else if (rpcResponse.error) {
+                // Handle server errors - log details but don't throw for this method
+                const error = rpcResponse.error;
+                console.error(`[MCPP Client] Server error (${error.code}): ${error.message}`, error.data);
+                
+                // For validation errors like missing data param, return null
+                if (error.code === -32602) {
+                    console.warn(`[MCPP Client] Invalid parameters: ${error.message}`);
+                }
+                
+                return null;
             } else {
-                console.error(`[MCPP Client] Failed to resolve placeholders: ${JSON.stringify(rpcResponse?.error)}`);
+                console.error(`[MCPP Client] Invalid response from server: no result or error field`);
                 return null;
             }
         } catch (error) {
@@ -453,7 +489,7 @@ export class McpClient {
 
     /**
      * New: Resolve placeholders with unified access controls
-     * @param data Data containing placeholders to resolve
+     * @param data Data containing placeholders to resolve (string, object, array)
      * @param usageContext Context for access control validation
      * @param toolName Optional tool name for context
      * @returns Resolved data or throws access control error
@@ -464,12 +500,15 @@ export class McpClient {
         toolName?: string
     ): Promise<ResolveResult> {
         try {
+            // Process data to strip server key prefixes from placeholders
+            const processedData = this.stripServerKeysFromPlaceholders(data);
+            
             const requestBody = {
                 jsonrpc: '2.0',
                 id: `req-${Date.now()}`,
                 method: 'mcpp/resolve_placeholders',
                 params: {
-                    data: data,
+                    data: processedData,
                     usage_context: usageContext,
                     tool_name: toolName
                 },
@@ -482,16 +521,50 @@ export class McpClient {
                 }
             });
             
-            const rpcResponse = parseMcpResponse<{ result: ResolveResult, error?: McppError }>(response.data);
-            if (rpcResponse && rpcResponse.result) {
+            const rpcResponse = parseMcpResponse<{ result?: ResolveResult, error?: McppError }>(response.data);
+            if (rpcResponse.result) {
+                // Log resolution status for debugging
+                if (rpcResponse.result.resolution_status) {
+                    const status = rpcResponse.result.resolution_status;
+                    console.log(`[MCPP Client] Placeholder resolution: ${status.resolved_placeholders}/${status.total_placeholders} resolved (${(status.success_rate * 100).toFixed(1)}%)`);
+                    if (status.failed_placeholders.length > 0) {
+                        console.warn(`[MCPP Client] Failed placeholders: ${status.failed_placeholders.join(', ')}`);
+                    }
+                }
                 return rpcResponse.result;
+            } else if (rpcResponse.error) {
+                // Handle specific MCPP errors
+                const error = rpcResponse.error;
+                console.error(`[MCPP Client] Server error (${error.code}): ${error.message}`, error.data);
+                throw error;
             } else {
-                throw rpcResponse.error || new Error('Failed to resolve placeholders');
+                throw new Error('Invalid response from server: no result or error field');
             }
         } catch (error) {
             console.error(`[MCPP Client] Error resolving placeholders with access control:`, error);
             throw error;
         }
+    }
+
+    /**
+     * Helper method to strip server key prefixes from placeholders in data
+     */
+    private stripServerKeysFromPlaceholders(data: unknown): unknown {
+        if (typeof data === 'string') {
+            // Handle string with placeholders
+            return data.replace(/\{([^:}]+):([^}]+)\}/g, '{$2}');
+        } else if (Array.isArray(data)) {
+            // Handle arrays recursively
+            return data.map(item => this.stripServerKeysFromPlaceholders(item));
+        } else if (data && typeof data === 'object') {
+            // Handle objects recursively
+            const result: Record<string, unknown> = {};
+            for (const [key, value] of Object.entries(data)) {
+                result[key] = this.stripServerKeysFromPlaceholders(value);
+            }
+            return result;
+        }
+        return data;
     }
 
     /**

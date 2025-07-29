@@ -26,17 +26,19 @@
 			"properties": {
 				"mcpClient.servers": {
 					"type": "object",
-					"description": "An array of MCP servers that can be used by the extension.",
+					"description": "Configuration for MCPP servers that can be used by the extension.",
 					"default": {
 						"zoho-creator-mcp": {
-							"description": "A server for interacting with the Zoho Creator API to manage applications, forms, and records.",
 							"type": "sse",
 							"url": "http://localhost:8000/mcpp"
 						},
 						"zoho-crm-mcp": {
-							"description": "A server for interacting with the Zoho CRM API to manage leads, contacts, and sales.",
 							"type": "sse",
 							"url": "http://localhost:8001/mcpp"
+						},
+						"zoho-books-mcp": {
+							"type": "sse",
+							"url": "http://localhost:8002/mcpp"
 						}
 					}
 				},
@@ -68,15 +70,19 @@
 	},
 	"scripts": {
 		"vscode:prepublish": "npm run compile",
-		"compile": "tsc -b",
-		"watch": "tsc -b -w",
-		"lint": "eslint",
-		"postinstall": "cd client && npm install && cd .."
+		"compile": "npx tsc -p client/tsconfig.json",
+		"watch": "npx tsc -p client/tsconfig.json -w",
+		"lint": "eslint"
+	},
+	"dependencies": {
+		"axios": "^0.21.1",
+		"openai": "^5.5.1"
 	},
 	"devDependencies": {
 		"@eslint/js": "^9.13.0",
 		"@stylistic/eslint-plugin": "^2.9.0",
 		"@types/node": "^20",
+		"@types/vscode": "^1.52.0",
 		"eslint": "^9.13.0",
 		"typescript": "^5.8.2",
 		"typescript-eslint": "^8.26.0"

@@ -58,7 +58,8 @@ export class ChatViewProvider implements WebviewViewProvider {
 	private _confirmationResolver?: (confirmed: boolean) => void;
 	private _chatHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
 	private _tools: ToolDefinition[] = [];
-	private _mcpClient?: McpClient;
+	// Map of serverKey to McpClient instances
+	private _mcpClients = new Map<string, McpClient>();
 
 	// Store last tool call summary and columns for reference
 	private _lastToolCallId?: string;
@@ -69,9 +70,6 @@ export class ChatViewProvider implements WebviewViewProvider {
 
 	// Map to store tool sensitivity
 	private _toolSensitivity = new Map<string, boolean>();
-
-	// Server key for multi-server placeholder routing (set this when switching servers)
-	private _currentServerKey = 'default'; // TODO: Set this dynamically in multi-server environments
 
 	// Map tool_call_id to tool info for validation
 	private _toolCallIdToInfo = new Map<string, { toolName: string, isSensitive: boolean }>();
@@ -165,13 +163,21 @@ export class ChatViewProvider implements WebviewViewProvider {
 			this._view?.webview.postMessage({ type: 'response', value: 'No MCP servers configured. Please check your settings.' });
 			return undefined;
 		}
+		
 		// If serverKey is not provided or not found, fall back to the first server
 		const chosenServerKey = serverKey && servers[serverKey] ? serverKey : Object.keys(servers)[0];
+		
+		// Return existing client if already created
+		if (this._mcpClients.has(chosenServerKey)) {
+			return this._mcpClients.get(chosenServerKey);
+		}
+		
+		// Create new client and cache it
 		const serverUrl = servers[chosenServerKey].url;
-		// Always create a new client for the chosen server (support multi-server)
-		this._currentServerKey = chosenServerKey;
-		this._mcpClient = new McpClient(serverUrl);
-		return this._mcpClient;
+		const client = new McpClient(serverUrl);
+		this._mcpClients.set(chosenServerKey, client);
+		
+		return client;
 	}
 
 	private async loadTools() {
@@ -185,21 +191,35 @@ export class ChatViewProvider implements WebviewViewProvider {
 			this._view?.webview.postMessage({ type: 'response', value: 'No MCP servers configured. Please check your settings.' });
 			return;
 		}
+		
+		// Clear existing mappings
+		this._toolNameToServerKey.clear();
+		this._toolSensitivity.clear();
+		
 		const allTools = [];
+		const serverErrors = [];
+		
 		// For each server, load tools and map toolName to serverKey
 		for (const [serverKey, serverConfig] of Object.entries(servers)) {
 			console.log(`Loading tools from server ${serverKey} at ${serverConfig.url}`);
-			const client = new McpClient(serverConfig.url);
+			
 			try {
+				const client = await this.getClient(serverKey);
+				if (!client) {
+					serverErrors.push(`Failed to create client for ${serverKey}`);
+					continue;
+				}
+				
 				const listToolsResponse = await client.listTools();
 				console.log(`Tools response from ${serverKey}:`, listToolsResponse);
 				
 				if (listToolsResponse.error || !listToolsResponse.result) {
 					const error = `Error listing tools from ${serverKey}: ${JSON.stringify(listToolsResponse.error)}`;
 					console.error(error);
-					this._view?.webview.postMessage({ type: 'response', value: error });
+					serverErrors.push(error);
 					continue;
 				}
+				
 				for (const tool of listToolsResponse.result.tools) {
 					console.log(`Adding tool ${tool.name} from server ${serverKey}`);
 					this._toolNameToServerKey.set(tool.name, serverKey);
@@ -207,13 +227,22 @@ export class ChatViewProvider implements WebviewViewProvider {
 					allTools.push(tool);
 				}
 			} catch (error) {
-				console.error(`Error communicating with MCP server ${serverKey}:`, error);
-				this._view?.webview.postMessage({ type: 'response', value: `Error communicating with MCP server ${serverKey}.` });
+				const errorMsg = `Error communicating with MCP server ${serverKey}: ${error}`;
+				console.error(errorMsg);
+				serverErrors.push(errorMsg);
 			}
 		}
+		
 		this._tools = allTools;
 		console.log('Final tools loaded:', this._tools.length, this._tools.map(t => t.name));
-		this._view?.webview.postMessage({ type: 'response', value: `Tools loaded: ${allTools.length} tools from ${Object.keys(servers).length} servers.` });
+		
+		// Show status message
+		let statusMessage = `Tools loaded: ${allTools.length} tools from ${Object.keys(servers).length} servers.`;
+		if (serverErrors.length > 0) {
+			statusMessage += `\n\nWarnings:\n${serverErrors.join('\n')}`;
+		}
+		
+		this._view?.webview.postMessage({ type: 'response', value: statusMessage });
 	}
 
 	private askForConfirmation(toolName: string, args: Record<string, unknown>): Promise<boolean> {
@@ -291,14 +320,16 @@ export class ChatViewProvider implements WebviewViewProvider {
 			}
 		}
 		const client = await this.getClient(serverKey);
+		if (!client) {
+			this._view?.webview.postMessage({ type: 'response', value: `Failed to connect to server for tool ${toolName}` });
+			return;
+		}
+		
 		const isSensitive = this._toolSensitivity.get(toolName);
 
 		// Track tool_call_id to tool info and serverKey for validation/routing
 		this._toolCallIdToInfo.set(toolCall.id, { toolName, isSensitive: !!isSensitive });
-		this._toolCallIdToServerKey.set(toolCall.id, serverKey || 'default');
-
-		// Extract serverKey from context (use _currentServerKey)
-		// const serverKey = this._currentServerKey || 'default';
+		this._toolCallIdToServerKey.set(toolCall.id, serverKey || Object.keys(this._mcpClients)[0]);
 
 		// For each argument, ensure placeholders include the serverKey
 		for (const key in args) {
@@ -543,17 +574,47 @@ export class ChatViewProvider implements WebviewViewProvider {
 
 			// Check if the LLM response is an MCPP action
 			if (message.content && typeof message.content === 'string') {
+				console.log(`[MCPP Client] ===== LLM RESPONSE PARSING DEBUG =====`);
+				console.log(`[MCPP Client] LLM response content:`, message.content);
+				
 				try {
 					const parsedContent = JSON.parse(message.content);
+					console.log(`[MCPP Client] Parsed content:`, parsedContent);
+					
 					if (parsedContent.mcpp_action) {
+						console.log(`[MCPP Client] Found MCPP action:`, parsedContent.mcpp_action);
 						// Add the message to chat history before handling the action
 						this._chatHistory.push(message);
 						await this.handleMcppAction(parsedContent.mcpp_action);
+						console.log(`[MCPP Client] ===== END LLM RESPONSE PARSING DEBUG =====`);
 						return;
+					} else {
+						console.log(`[MCPP Client] No mcpp_action found in parsed content`);
 					}
-				} catch {
-					// Not a JSON response, continue with normal processing
+				} catch (parseError) {
+					console.log(`[MCPP Client] Failed to parse as JSON:`, parseError);
+					// Not a JSON response, check for placeholders in plain text
+					const placeholders = this.extractPlaceholdersFromText(message.content);
+					if (placeholders.length > 0) {
+						console.log(`[MCPP Client] Found ${placeholders.length} placeholders in plain text:`, placeholders);
+						console.log(`[MCPP Client] Original message: "${message.content}"`);
+						// Add the message to chat history before handling placeholder resolution
+						this._chatHistory.push(message);
+						// Auto-resolve placeholders and display the result
+						await this.handlePlaceholderMessageAction({
+							message: message.content,
+							fallback_message: message.content,
+							usage_context: undefined
+						});
+						console.log(`[MCPP Client] ===== END LLM RESPONSE PARSING DEBUG =====`);
+						return;
+					} else {
+						console.log(`[MCPP Client] No placeholders found in plain text`);
+					}
 				}
+				console.log(`[MCPP Client] ===== END LLM RESPONSE PARSING DEBUG =====`);
+			} else {
+				console.log(`[MCPP Client] Message content is not a string:`, typeof message.content, message.content);
 			}
 
 			if (message.tool_calls) {
@@ -731,30 +792,38 @@ export class ChatViewProvider implements WebviewViewProvider {
 	 * Handle placeholder_message action - Resolve placeholders and display result
 	 */
 	private async handlePlaceholderMessageAction(data: { message: string, fallback_message: string, usage_context?: UsageContext }) {
-		const { message, fallback_message, usage_context } = data;
+		const { message, fallback_message } = data;
+		
+		console.log(`[MCPP Client] ===== EFFICIENT PLACEHOLDER RESOLUTION =====`);
+		console.log(`[MCPP Client] Message: "${message}"`);
+		console.log(`[MCPP Client] Fallback: "${fallback_message}"`);
+		
+		// Extract placeholders from the message
+		const placeholders = this.extractPlaceholdersFromText(message);
+		console.log(`[MCPP Client] Detected placeholders:`, placeholders);
+		
+		if (placeholders.length === 0) {
+			console.log(`[MCPP Client] No placeholders detected - returning message as-is`);
+			this._view?.webview.postMessage({ type: 'response', value: message });
+			return;
+		}
 		
 		try {
-			let resolvedMessage: string;
+			// Efficiently resolve all placeholders
+			const resolvedMessage = await this.resolveMessagePlaceholdersEfficiently(message, placeholders);
 			
-			if (usage_context) {
-				// Use new access control system
-				const resolvedData = await this.resolveWithAccessControl(
-					message,
-					usage_context.data_usage,
-					usage_context.target.type,
-					usage_context.target.destination,
-					usage_context.target.purpose
-				);
-				resolvedMessage = String(resolvedData);
+			console.log(`[MCPP Client] Original: "${message}"`);
+			console.log(`[MCPP Client] Resolved: "${resolvedMessage}"`);
+			
+			if (resolvedMessage === message) {
+				console.warn(`[MCPP Client] *** Resolution failed - using fallback ***`);
+				this._view?.webview.postMessage({ type: 'response', value: fallback_message });
 			} else {
-				// Fallback to legacy resolution system
-				resolvedMessage = await this.legacyResolvePlaceholders(message);
+				console.log(`[MCPP Client] *** Resolution successful ***`);
+				this._view?.webview.postMessage({ type: 'response', value: resolvedMessage });
 			}
-			
-			this._view?.webview.postMessage({ type: 'response', value: resolvedMessage });
 		} catch (error) {
-			console.error('Error resolving placeholders:', error);
-			// Use fallback message if resolution fails
+			console.error('[MCPP Client] Error resolving placeholders:', error);
 			this._view?.webview.postMessage({ type: 'response', value: fallback_message });
 		}
 	}
@@ -763,71 +832,33 @@ export class ChatViewProvider implements WebviewViewProvider {
 	 * Legacy placeholder resolution for backward compatibility
 	 */
 	private async legacyResolvePlaceholders(message: string): Promise<string> {
-		// Group placeholders by server for efficient resolution
-		const placeholdersByServer: Record<string, Set<string>> = {};
-		const placeholderRegex = /\{([^}]+)\}/g;
-		let match;
-		
-		// Find all placeholders and group them by server
-		while ((match = placeholderRegex.exec(message)) !== null) {
-			const placeholder = match[1];
-			const toolCallId = placeholder.split('.')[0];
-			const serverKey = this._toolCallIdToServerKey.get(toolCallId);
-			
-			if (serverKey) {
-				if (!placeholdersByServer[serverKey]) {
-					placeholdersByServer[serverKey] = new Set();
-				}
-				placeholdersByServer[serverKey].add(placeholder);
-			}
-		}
-
-		if (Object.keys(placeholdersByServer).length === 0) {
-			// No placeholders to resolve, just return the message
+		// Use the newer resolvePlaceholderData method directly on the first available client
+		// This is a simplified approach for backward compatibility
+		const firstClient = await this.getClient();
+		if (!firstClient) {
+			console.error('[MCPP Client] No MCP client available for placeholder resolution');
 			return message;
 		}
 
-		// For multi-server scenarios, we need to resolve each server's placeholders separately
-		// and then combine the results
-		let resolvedMessage = message;
-		let resolutionSuccessful = true;
-
-		for (const serverKey of Object.keys(placeholdersByServer)) {
-			const client = await this.getClient(serverKey);
-			if (!client) {
-				console.error(`No client available for server: ${serverKey}`);
-				resolutionSuccessful = false;
-				continue;
+		try {
+			console.log(`[MCPP Client] Legacy resolution: resolving message: "${message}"`);
+			console.log(`[MCPP Client] Calling resolvePlaceholderData on client:`, !!firstClient);
+			const result = await firstClient.resolvePlaceholderData(message);
+			console.log(`[MCPP Client] Raw result from resolvePlaceholderData:`, result);
+			if (result && result.data) {
+				console.log(`[MCPP Client] Legacy resolution successful, result.data:`, result.data);
+				console.log(`[MCPP Client] Type of result.data:`, typeof result.data);
+				const resolvedMessage = String(result.data);
+				console.log(`[MCPP Client] Final resolved message: "${resolvedMessage}"`);
+				return resolvedMessage;
+			} else {
+				console.warn(`[MCPP Client] Legacy resolution failed or returned no data, result:`, result);
+				return message;
 			}
-
-			try {
-				// Create a message with only this server's placeholders for efficient resolution
-				const serverSpecificMessage = message.replace(placeholderRegex, (fullMatch, placeholder) => {
-					const toolCallId = placeholder.split('.')[0];
-					const placeholderServerKey = this._toolCallIdToServerKey.get(toolCallId);
-					
-					return placeholderServerKey === serverKey ? fullMatch : placeholder;
-				});
-
-				const resolutionResult = await client.resolvePlaceholderText(serverSpecificMessage);
-				if (resolutionResult && resolutionResult.placeholders) {
-					// Apply resolved placeholders to the message
-					for (const [placeholderKey, resolvedValue] of Object.entries(resolutionResult.placeholders)) {
-						const fullPlaceholder = `{${placeholderKey}}`;
-						resolvedMessage = resolvedMessage.replace(fullPlaceholder, String(resolvedValue));
-					}
-				}
-			} catch (error) {
-				console.error(`Error resolving placeholders for server ${serverKey}:`, error);
-				resolutionSuccessful = false;
-			}
+		} catch (error) {
+			console.error(`[MCPP Client] Legacy placeholder resolution error:`, error);
+			return message;
 		}
-
-		if (!resolutionSuccessful) {
-			throw new Error('Failed to resolve some placeholders');
-		}
-
-		return resolvedMessage;
 	}
 
 	/**
@@ -980,6 +1011,215 @@ Do you want to allow this data transfer?
 	}
 
 	/**
+	 * Extract placeholders from plain text content
+	 * Matches patterns like {call_XjsFj5wTs9UUm7bNfdnn2oh6.3.Email} or {tool_call_id.row_index.column_name}
+	 */
+	private extractPlaceholdersFromText(text: string): string[] {
+		const placeholderRegex = /\{([^}]+)\}/g;
+		const placeholders: string[] = [];
+		let match;
+		
+		while ((match = placeholderRegex.exec(text)) !== null) {
+			const placeholder = match[1];
+			// Check if it looks like a call reference (contains call_ or has tool_call_id.row.column structure)
+			if (placeholder.includes('call_') || /^[^.]+\.\d+\.[^.]+/.test(placeholder)) {
+				placeholders.push(placeholder);
+			}
+		}
+		
+		return placeholders;
+	}
+
+	/**
+	 * Efficiently resolve all placeholders in a message by grouping them by server
+	 * and sending batch requests to minimize server calls
+	 */
+	private async resolveMessagePlaceholdersEfficiently(message: string, placeholders: string[]): Promise<string> {
+		console.log(`[MCPP Client] ===== EFFICIENT PLACEHOLDER RESOLUTION PROCESS =====`);
+		console.log(`[MCPP Client] Input message: "${message}"`);
+		console.log(`[MCPP Client] Placeholders to resolve:`, placeholders);
+		
+		// Step 1: Group placeholders by their source server
+		const placeholdersByServer = await this.groupPlaceholdersByServer(placeholders);
+		console.log(`[MCPP Client] Placeholders grouped by server:`, placeholdersByServer);
+		
+		if (Object.keys(placeholdersByServer).length === 0) {
+			console.log(`[MCPP Client] No placeholders could be mapped to servers`);
+			return message;
+		}
+		
+		// Step 2: Resolve placeholders from each server in parallel
+		const resolutionPromises = Object.entries(placeholdersByServer).map(async ([serverKey, serverPlaceholders]) => {
+			console.log(`[MCPP Client] Resolving ${serverPlaceholders.length} placeholders from server: ${serverKey}`);
+			return this.resolvePlaceholdersFromServer(serverKey, serverPlaceholders);
+		});
+		
+		const resolutionResults = await Promise.allSettled(resolutionPromises);
+		console.log(`[MCPP Client] Resolution results:`, resolutionResults);
+		
+		// Step 3: Collect all resolved values
+		const resolvedValues: Record<string, string> = {};
+		resolutionResults.forEach((result, index) => {
+			if (result.status === 'fulfilled' && result.value) {
+				Object.assign(resolvedValues, result.value);
+			} else {
+				console.warn(`[MCPP Client] Failed to resolve from server ${Object.keys(placeholdersByServer)[index]}:`, result);
+			}
+		});
+		
+		console.log(`[MCPP Client] All resolved values:`, resolvedValues);
+		
+		// Step 4: Replace all placeholders in the message
+		let resolvedMessage = message;
+		for (const placeholder of placeholders) {
+			const resolvedValue = resolvedValues[placeholder];
+			if (resolvedValue !== undefined) {
+				const placeholderPattern = `{${placeholder}}`;
+				resolvedMessage = resolvedMessage.replace(new RegExp(this.escapeRegex(placeholderPattern), 'g'), resolvedValue);
+				console.log(`[MCPP Client] Replaced ${placeholderPattern} with: ${resolvedValue}`);
+			} else {
+				console.warn(`[MCPP Client] No resolution found for placeholder: ${placeholder}`);
+			}
+		}
+		
+		console.log(`[MCPP Client] Final resolved message: "${resolvedMessage}"`);
+		console.log(`[MCPP Client] ===== END EFFICIENT RESOLUTION PROCESS =====`);
+		return resolvedMessage;
+	}
+
+	/**
+	 * Group placeholders by their source server using tool call history
+	 */
+	private async groupPlaceholdersByServer(placeholders: string[]): Promise<Record<string, string[]>> {
+		const placeholdersByServer: Record<string, string[]> = {};
+		
+		for (const placeholder of placeholders) {
+			// Extract tool call ID from placeholder (e.g., "call_XjsFj5wTs9UUm7bNfdnn2oh6.3.Email" -> "call_XjsFj5wTs9UUm7bNfdnn2oh6")
+			const toolCallId = this.extractToolCallIdFromPlaceholder(placeholder);
+			console.log(`[MCPP Client] Placeholder: ${placeholder} -> Tool Call ID: ${toolCallId}`);
+			
+			if (toolCallId) {
+				// Find which server handled this tool call
+				const serverKey = this._toolCallIdToServerKey.get(toolCallId);
+				console.log(`[MCPP Client] Tool Call ID: ${toolCallId} -> Server: ${serverKey}`);
+				
+				if (serverKey) {
+					if (!placeholdersByServer[serverKey]) {
+						placeholdersByServer[serverKey] = [];
+					}
+					placeholdersByServer[serverKey].push(placeholder);
+				} else {
+					console.warn(`[MCPP Client] No server found for tool call ID: ${toolCallId}`);
+					// Try all available servers as fallback
+					const availableServers = this.getAvailableServerKeys();
+					if (availableServers.length > 0) {
+						const fallbackServer = availableServers[0];
+						console.log(`[MCPP Client] Using fallback server: ${fallbackServer}`);
+						if (!placeholdersByServer[fallbackServer]) {
+							placeholdersByServer[fallbackServer] = [];
+						}
+						placeholdersByServer[fallbackServer].push(placeholder);
+					}
+				}
+			} else {
+				console.warn(`[MCPP Client] Could not extract tool call ID from placeholder: ${placeholder}`);
+			}
+		}
+		
+		return placeholdersByServer;
+	}
+
+	/**
+	 * Extract tool call ID from a placeholder
+	 * e.g., "call_XjsFj5wTs9UUm7bNfdnn2oh6.3.Email" -> "call_XjsFj5wTs9UUm7bNfdnn2oh6"
+	 */
+	private extractToolCallIdFromPlaceholder(placeholder: string): string | null {
+		// Handle format: call_ID.row.column
+		const match = placeholder.match(/^(call_[^.]+)/);
+		if (match) {
+			return match[1];
+		}
+		
+		// Handle format: tool_call_id.row.column  
+		const dotMatch = placeholder.match(/^([^.]+)\.\d+\.[^.]+$/);
+		if (dotMatch) {
+			return dotMatch[1];
+		}
+		
+		console.warn(`[MCPP Client] Unrecognized placeholder format: ${placeholder}`);
+		return null;
+	}
+
+	/**
+	 * Resolve placeholders from a specific server
+	 */
+	private async resolvePlaceholdersFromServer(serverKey: string, placeholders: string[]): Promise<Record<string, string> | null> {
+		console.log(`[MCPP Client] Resolving ${placeholders.length} placeholders from server ${serverKey}:`, placeholders);
+		
+		const client = await this.getClient(serverKey);
+		if (!client) {
+			console.error(`[MCPP Client] No client available for server: ${serverKey}`);
+			return null;
+		}
+		
+		try {
+			// Create usage context for display
+			const usageContext = client.createUsageContext(
+				'display',
+				'client', 
+				'vscode-chat-view',
+				'user_display'
+			);
+			
+			// Create a batch request with all placeholders for this server
+			const batchData: Record<string, string> = {};
+			placeholders.forEach((placeholder, index) => {
+				batchData[`placeholder_${index}`] = `{${placeholder}}`;
+			});
+			
+			console.log(`[MCPP Client] Sending batch request to ${serverKey}:`, batchData);
+			
+			const result = await client.resolvePlaceholdersWithAccessControl(batchData, usageContext);
+			console.log(`[MCPP Client] Server ${serverKey} response:`, result);
+			
+			if (result.resolved_data && typeof result.resolved_data === 'object') {
+				// Map resolved data back to original placeholders
+				const resolvedValues: Record<string, string> = {};
+				placeholders.forEach((placeholder, index) => {
+					const key = `placeholder_${index}`;
+					const resolvedValue = (result.resolved_data as Record<string, unknown>)[key];
+					if (resolvedValue !== undefined) {
+						resolvedValues[placeholder] = String(resolvedValue);
+					}
+				});
+				
+				console.log(`[MCPP Client] Resolved values from ${serverKey}:`, resolvedValues);
+				return resolvedValues;
+			}
+			
+			console.warn(`[MCPP Client] Server ${serverKey} returned unexpected format:`, result);
+			return null;
+		} catch (error) {
+			console.error(`[MCPP Client] Error resolving from server ${serverKey}:`, error);
+			return null;
+		}
+	}
+
+	/**
+	 * Get available server keys
+	 */
+	private getAvailableServerKeys(): string[] {
+		return Array.from(this._mcpClients.keys());
+	}
+
+	/**
+	 * Escape special regex characters
+	 */
+	private escapeRegex(string: string): string {
+		return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	}
+
+	/**
 	 * Handle placeholder resolution with access controls
 	 */
 	private async resolveWithAccessControl(
@@ -990,6 +1230,14 @@ Do you want to allow this data transfer?
 		purpose?: string,
 		toolName?: string
 	): Promise<unknown> {
+		console.log(`[MCPP Client] ===== RESOLVE WITH ACCESS CONTROL DEBUG =====`);
+		console.log(`[MCPP Client] Input data:`, data);
+		console.log(`[MCPP Client] Data usage:`, dataUsage);
+		console.log(`[MCPP Client] Target type:`, targetType);
+		console.log(`[MCPP Client] Destination:`, destination);
+		console.log(`[MCPP Client] Purpose:`, purpose);
+		console.log(`[MCPP Client] Tool name:`, toolName);
+		
 		const client = await this.getClient();
 		if (!client) {
 			throw new Error('MCP Client not initialized');
@@ -997,13 +1245,40 @@ Do you want to allow this data transfer?
 
 		try {
 			const usageContext = client.createUsageContext(dataUsage, targetType, destination, purpose);
+			console.log(`[MCPP Client] Created usage context:`, usageContext);
+			
 			const result = await client.resolvePlaceholdersWithAccessControl(data, usageContext, toolName);
+			console.log(`[MCPP Client] Server result:`, result);
+			
+			// Log resolution status for debugging
+			if (result.resolution_status) {
+				console.log(`[MCPP Client] Placeholder resolution: ${result.resolution_status.resolved_placeholders}/${result.resolution_status.total_placeholders} resolved (${(result.resolution_status.success_rate * 100).toFixed(1)}%)`);
+				if (result.resolution_status.failed_placeholders.length > 0) {
+					console.warn(`[MCPP Client] Failed placeholders: ${result.resolution_status.failed_placeholders.join(', ')}`);
+				}
+			}
+			
+			console.log(`[MCPP Client] Returning resolved_data:`, result.resolved_data);
+			console.log(`[MCPP Client] ===== END RESOLVE WITH ACCESS CONTROL DEBUG =====`);
 			return result.resolved_data;
 		} catch (error: unknown) {
 			// Handle access control errors
 			if (client.isConsentRequiredError(error)) {
-				// Extract consent request and present to user
-				const consentRequest = error.data.consent_request;
+				// Extract consent request and convert to expected format
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const serverConsentRequest = error.data.consent_request as any; // Server format from your examples
+				const consentRequest: ConsentRequest = {
+					request_id: serverConsentRequest.request_id,
+					message: serverConsentRequest.custom_message || 
+						`Permission needed to ${serverConsentRequest.transfer_details?.data_usage || 'process'} data ` +
+						`from ${serverConsentRequest.tool_name} to ${serverConsentRequest.transfer_details?.destination_description || 'destination'}. ` +
+						`This will affect ${serverConsentRequest.data_summary?.placeholder_count || 0} data item(s).`,
+					timeout_seconds: serverConsentRequest.options?.timeout_seconds || 30,
+					allow_remember: serverConsentRequest.options?.allow_remember || false,
+					data_preview: serverConsentRequest.data_summary ? 
+						`Data types: ${serverConsentRequest.data_summary.data_types?.join(', ') || 'unknown'}` : undefined,
+					destination_info: serverConsentRequest.transfer_details?.destination_description
+				};
 				return await this.handleConsentFlow(consentRequest, data, client);
 			} else if (client.isAccessControlError(error)) {
 				// Handle other access control errors
@@ -1079,6 +1354,18 @@ Do you want to allow this data transfer?
 				}, consentRequest.timeout_seconds * 1000);
 			}
 		});
+	}
+
+	/**
+	 * Clear all cached clients and reload configuration
+	 */
+	public refreshConfiguration() {
+		this._mcpClients.clear();
+		this._toolNameToServerKey.clear();
+		this._toolSensitivity.clear();
+		this._toolCallIdToInfo.clear();
+		this._toolCallIdToServerKey.clear();
+		this.loadTools();
 	}
 
 	private _getHtmlForWebview(webview: Webview) {

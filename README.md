@@ -1,13 +1,68 @@
-# MCPP Client Example
+# MCPP Client for VSCode
 
-This is a Visual Studio Code extension that acts as a client for MCPP (Model Context Privacy Protocol) servers. It provides a chat interface to interact with different MCPP servers, powered by an OpenAI Large Language Model.
+A VSCode extension that provides a chat interface for interacting with MCPP (Model Context Privacy Protocol) servers.
 
 ## Features
 
-- **Chat View:** A dedicated view in the explorer to send queries and receive responses from MCPP servers.
-- **Privacy-Enhanced Data Handling:** Implements the Model Context Privacy Protocol to protect sensitive data while enabling complex workflows.
-- **Pluggable MCPP Servers:** The client is designed to be extensible to connect to various available MCPP servers.
-- **LLM Powered:** Utilizes an OpenAI LLM to process and respond to queries while maintaining data privacy.
+- **Privacy-First**: Sensitive data is never exposed to LLMs - only placeholders are used
+- **Multi-Server Support**: Connect to multiple MCPP servers simultaneously  
+- **Unified Access Controls**: Fine-grained permissions for different targets (LLMs, servers, clients)
+- **Consent Management**: User consent flows for sensitive data operations
+- **Rich Chat Interface**: Modern chat UI with data visualization and tool confirmations
+
+## Quick Start
+
+### 1. Configuration
+
+Edit `.vscode/settings.json` in your workspace:
+
+```json
+{
+  "mcpClient.servers": {
+    "my-server": {
+      "description": "My MCPP server",
+      "type": "sse",
+      "url": "http://localhost:8000/mcpp"
+    }
+  },
+  "mcpClient.openaiApiKey": "sk-your-openai-api-key-here"
+}
+```
+
+### 2. Usage
+
+1. Start your MCPP server(s)
+2. Open VSCode and install/load this extension
+3. Open the "MCP Chat" view from the sidebar
+4. Start chatting with your privacy-aware assistant!
+
+## Server Configuration
+
+Each server entry requires:
+- **Server Key**: Unique identifier (e.g., "my-server")
+- **description**: Human-readable description
+- **type**: Connection type (currently only "sse" supported)
+- **url**: Server endpoint URL ending with `/mcpp`
+
+## Privacy & Security
+
+- **Placeholder System**: Sensitive data appears as `{tool_123.0.email}` to the LLM
+- **Access Controls**: Granular permissions for data usage (display/process/store/transfer)
+- **Consent Management**: User approval required for sensitive operations
+- **Multi-Server Routing**: Secure cross-server data references
+
+## Development
+
+```bash
+npm run compile   # Compile TypeScript
+npm run watch     # Watch mode for development
+```
+
+## Protocol
+
+This client implements the MCPP (Model Context Privacy Protocol) specification, which extends the standard MCP protocol with privacy and access control features.
+
+See `MCPP_HOST_GUIDE.md` for detailed protocol specification.
 
 ## Running the Sample
 
